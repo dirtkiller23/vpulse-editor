@@ -7,6 +7,8 @@ use crate::typing::*;
 use super::help;
 use crate::pulsetypes::*;
 use crate::bindings::FunctionBinding;
+use crate::app::help::help_hover_text;
+use crate::app::FullGraphState;
 
 impl Default for PulseGraphValueType {
     fn default() -> Self {
@@ -26,6 +28,12 @@ impl PulseGraphState {
     }
     pub fn get_library_binding_from_index(&self, index: LibraryBindingIndex) -> Option<&FunctionBinding> {
         self.bindings.find_function_by_id(index)
+    }
+    // Limited comparison for fields that actually change during normal editing.
+    pub fn eq_limited(&self, other: &Self) -> bool {
+        self.public_outputs == other.public_outputs &&
+        self.variables == other.variables &&
+        self.exposed_nodes == other.exposed_nodes
     }
 }
 
@@ -402,6 +410,16 @@ impl NodeTemplateTrait for PulseNodeTemplate {
         // It's okay to delegate this to node_finder_label if you don't want to
         // show different names in the node finder and the node itself.
         self.node_finder_label(user_state).into()
+    }
+
+    fn node_finder_description<'a>(&'a self, user_state: &'a Self::UserState) -> Option<Cow<'a, str>> {
+        //Cow::Owned().into_owned())
+        let text = help_hover_text(*self, user_state);
+        if !text.is_empty() {
+            Some(text)
+        } else {
+            None
+        }
     }
 
     fn user_data(&self, _user_state: &mut Self::UserState) -> Self::NodeData {
@@ -1686,5 +1704,20 @@ impl Default for EditorConfig {
             assetassembler_path: PathBuf::from(""),
             red2_template_path: PathBuf::from("graph_red2_template.kv3"),
         }
+    }
+}
+
+fn slotmap_eq <K: slotmap::Key, T: PartialEq>(a: &slotmap::SlotMap<K, T>, b: &slotmap::SlotMap<K, T>) -> bool {
+    a.len() == b.len() && a.iter().all(|(key, value)| b.get(key) == Some(value))
+}
+
+impl PartialEq for FullGraphState {
+    fn eq(&self, other: &Self) -> bool {
+        self.state.graph.connections == other.state.graph.connections &&
+        slotmap_eq(&self.state.graph.nodes, &other.state.graph.nodes) &&
+        slotmap_eq(&self.state.graph.inputs, &other.state.graph.inputs) &&
+        slotmap_eq(&self.state.graph.outputs, &other.state.graph.outputs) &&
+        // user_state has PartialEq derived, but for purposes of undo we only want to compare some fields that are relevant to us.
+        self.user_state.eq_limited(&other.user_state)
     }
 }

@@ -4,11 +4,12 @@ mod help;
 pub mod types;
 mod migrations;
 
+use delegate::delegate;
+use std::time::UNIX_EPOCH;
 use std::{path::PathBuf, fs, thread};
 use core::panic;
-use eframe::egui::Button;
-use eframe::egui::TextStyle;
-use eframe::egui::Vec2;
+use eframe::egui::util::undoer::{Settings, Undoer};
+use eframe::egui::{Button, TextStyle, Vec2};
 use serde::{Deserialize, Serialize};
 use rfd::{FileDialog, MessageDialog};
 use anyhow::anyhow;
@@ -22,7 +23,7 @@ use crate::utils::get_node_ids_connected_to_output;
 use types::*;
 
 static APP_NAME: &str = "Pulse Graph Editor";
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
 pub enum ModalWindowType {
     #[default]
@@ -30,71 +31,59 @@ pub enum ModalWindowType {
     ConfirmSave
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
 pub struct ModalWindow {
     pub window_type: ModalWindowType,
     pub is_open: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[cfg_attr(feature = "persistence", derive(Serialize, Deserialize))]
-pub struct PulseGraphEditor {
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    #[allow(unused)]
-    version: FileVersion,
-    state: MyEditorState,
-    user_state: PulseGraphState,
-    #[cfg(feature = "nongame_asset_build")]
-    #[serde(skip)]
-    editor_config: EditorConfig,
-    #[serde(skip)]
-    current_modal_dialog: ModalWindow,
+pub struct FullGraphState {
+    pub state: MyEditorState,
+    pub user_state: PulseGraphState
 }
 
-impl PulseGraphEditor {
+impl FullGraphState {
+    pub fn state(&self) -> &MyEditorState {
+        &self.state
+    }
+    pub fn state_mut(&mut self) -> &mut MyEditorState {
+        &mut self.state
+    }
+    pub fn user_state(&self) -> &PulseGraphState {
+        &self.user_state
+    }
+    pub fn user_state_mut(&mut self) -> &mut PulseGraphState {
+        &mut self.user_state
+    }
+
+    pub fn load_state(&mut self, filepath: &PathBuf) -> Result<(), anyhow::Error> {
+        let contents = fs::read_to_string(filepath)?;
+        let loaded_graph: FullGraphState = ron::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse file: {}",
+                e.to_string()
+            )
+        })?;
+        self.state = loaded_graph.state;
+        self.user_state.load_from(loaded_graph.user_state);
+        self.user_state.save_file_path = Some(filepath.clone());
+        self.verify_compat();
+        Ok(())
+    }
+
     fn save_graph(&self, filepath: &PathBuf) -> Result<(), anyhow::Error> {
-        let res = ron::ser::to_string_pretty::<PulseGraphEditor>(
+        let res = ron::ser::to_string_pretty::<FullGraphState>(
             self,
             ron::ser::PrettyConfig::default(),
         )?;
         fs::write(filepath, res)?;
         Ok(())
     }
-    // perform a save including including some cleanup
-    fn perform_save(&mut self, filepath: Option<&PathBuf>) -> anyhow::Result<()> {
-        let dest_path;
-        // remove the path on manual save (we don't use serde skip because we want to save it within autosaves)
-        let save_path = self.user_state.save_file_path.take();
-        if let Some(filepath) = filepath {
-            dest_path = filepath;
-        } else {
-            // if no filepath is provided, assume the one in saved state
-            if let Some(filepath) = save_path.as_ref() {
-                dest_path = filepath;
-            } else {
-                return Err(anyhow!(
-                    "No file path provided for saving the graph. This should not happen"
-                ));
-            }
-        }
-        self.save_graph(dest_path)?;
-        // restore the path info to memory.
-        self.user_state.save_file_path = save_path;
-        Ok(())
-    }
-    // promts user to choose a file to save the graph to and remembers the location for saving.
-    fn dialog_change_save_file(&mut self) -> bool {
-        let chosen_file = FileDialog::new()
-            .add_filter("Pulse Graph Editor State", &["ron"])
-            .save_file();
-        let did_pick = chosen_file.as_ref().is_some(); // if not, the user cancelled so we should note that
-        if did_pick {
-            self.user_state.save_file_path = chosen_file;
-        }
-        did_pick
-    }
-    // Applies some corrections if some data is missing or changed for files saved in older versions
+
+     // Applies some corrections if some data is missing or changed for files saved in older versions
     pub fn verify_compat(&mut self) {
         // v0.1.1 introduces a SecondaryMap node_sizes in GraphEditorState
         // make sure that it is populated with every existing node.
@@ -118,7 +107,7 @@ impl PulseGraphEditor {
             let node = match self.state.graph.nodes.get_mut(node_id) {
                 Some(node) => node,
                 None => continue,
-            };
+            };  
             let template = node.user_data.template;
             match template {
                 // verify that all existing library binding nodes have correct parameters, in case they have been updated between sessions.
@@ -170,11 +159,11 @@ impl PulseGraphEditor {
                             .get_input("nodeId")
                             .ok()
                             .and_then(|input_id| {
-                                self.state.graph.get_input(input_id).value().clone().try_node_id().ok()
+                                self.state().graph.get_input(input_id).value().clone().try_node_id().ok()
                             });
 
                         if let Some(target_node_id) = target_node_id {
-                            if let Some(target_node) = self.state.graph.nodes.get(target_node_id) {
+                            if let Some(target_node) = self.state().graph.nodes.get(target_node_id) {
                                 match target_node.user_data.template {
                                     PulseNodeTemplate::Function => { call_func_nodes.push(node_id); },
                                     PulseNodeTemplate::ListenForEntityOutput => { listen_entity_output_nodes.push(node_id); },
@@ -256,6 +245,7 @@ impl PulseGraphEditor {
                 true,
             );
         }
+
         // this fills out the default domain and subdomain if they're not set at launch time
         if self.user_state.graph_domain.is_empty() {
             self.user_state.graph_domain = "ServerEntity".to_string();
@@ -264,43 +254,96 @@ impl PulseGraphEditor {
             self.user_state.graph_subtype = "PVAL_EHANDLE:point_pulse".to_string();
         }
     }
-    fn load_graph(&mut self, filepath: &PathBuf) -> Result<(), anyhow::Error> {
-        let contents = fs::read_to_string(filepath)?;
-        let loaded_graph: PulseGraphEditor = ron::from_str(&contents).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse file: {}",
-                e.to_string()
-            )
-        })?;
-        self.state = loaded_graph.state;
-        self.user_state.load_from(loaded_graph.user_state);
-        // we don't serialize file path since the file could be moved between save/open.
-        self.user_state.save_file_path = Some(filepath.clone());
-        self.verify_compat();
+}
+
+#[derive(Default, Clone)]
+pub struct PulseGraphEditor {
+    #[allow(unused)]
+    version: FileVersion,
+    full_state: FullGraphState,
+    #[cfg(feature = "nongame_asset_build")]
+    editor_config: EditorConfig,
+    current_modal_dialog: ModalWindow,
+    undoer: Undoer<FullGraphState>,
+}
+
+impl PulseGraphEditor {
+    delegate! {
+        to self.full_state {
+            pub fn state(&self) -> &MyEditorState;
+            pub fn state_mut(&mut self) -> &mut MyEditorState;
+            pub fn user_state(&self) -> &PulseGraphState;
+            pub fn user_state_mut(&mut self) -> &mut PulseGraphState;
+        }
+    }
+    fn save_graph(&self, filepath: &PathBuf) -> Result<(), anyhow::Error> {
+        self.full_state.save_graph(filepath)
+    }
+    // perform a save including including some cleanup
+    fn perform_save(&mut self, filepath: Option<&PathBuf>) -> anyhow::Result<()> {
+        let dest_path;
+        // remove the path on manual save (we don't use serde skip because we want to save it within autosaves)
+        let save_path = self.full_state.user_state.save_file_path.take();
+        if let Some(filepath) = filepath {
+            dest_path = filepath;
+        } else {
+            // if no filepath is provided, assume the one in saved state
+            if let Some(filepath) = save_path.as_ref() {
+                dest_path = filepath;
+            } else {
+                return Err(anyhow!(
+                    "No file path provided for saving the graph. This should not happen"
+                ));
+            }
+        }
+        self.save_graph(dest_path)?;
+        // restore the path info to memory.
+        self.full_state.user_state.save_file_path = save_path;
         Ok(())
     }
+    // promts user to choose a file to save the graph to and remembers the location for saving.
+    fn dialog_change_save_file(&mut self) -> bool {
+        let chosen_file = FileDialog::new()
+            .add_filter("Pulse Graph Editor State", &["ron"])
+            .save_file();
+        let did_pick = chosen_file.as_ref().is_some(); // if not, the user cancelled so we should note that
+        if did_pick {
+            self.full_state.user_state.save_file_path = chosen_file;
+        }
+        did_pick
+    }
+   
+    fn load_graph(&mut self, filepath: &PathBuf) -> Result<(), anyhow::Error> {
+        let res = self.full_state.load_state(filepath);
+        if res.is_ok() {
+            self.undoer = Self::get_new_undoer();
+        }
+        res
+    }
     fn new_graph(&mut self, ctx: &egui::Context) {
-        self.state = MyEditorState::default();
-        self.user_state.load_from(PulseGraphState::default());
-        self.user_state.save_file_path = None;
+        self.undoer = Self::get_new_undoer();
+        self.full_state.state = MyEditorState::default();
+        self.user_state_mut().load_from(PulseGraphState::default());
+        self.user_state_mut().save_file_path = None;
         self.update_titlebar(ctx);
     }
     pub fn update_output_node_param(&mut self, node_id: NodeId, name: &String, input_name: &str) {
         let param = self
-            .state
+            .state_mut()
             .graph
             .nodes
             .get_mut(node_id)
             .unwrap()
             .get_input(input_name);
         if let Ok(param) = param {
-            self.state.graph.remove_input_param(param);
+            self.state_mut().graph.remove_input_param(param);
         }
-        for output in self.user_state.public_outputs.iter() {
+        let public_outputs: Vec<_> = self.user_state().public_outputs.to_vec();
+        for output in public_outputs {
             if output.name == *name {
                 match output.typ {
                     PulseValueType::PVAL_FLOAT(_) | PulseValueType::PVAL_INT(_) => {
-                        self.state.graph.add_input_param(
+                        self.state_mut().graph.add_input_param(
                             node_id,
                             String::from(input_name),
                             PulseDataType::Scalar,
@@ -310,7 +353,7 @@ impl PulseGraphEditor {
                         );
                     }
                     PulseValueType::PVAL_STRING(_) => {
-                        self.state.graph.add_input_param(
+                        self.state_mut().graph.add_input_param(
                             node_id,
                             String::from(input_name),
                             PulseDataType::String,
@@ -322,7 +365,7 @@ impl PulseGraphEditor {
                         );
                     }
                     PulseValueType::PVAL_VEC3(_) => {
-                        self.state.graph.add_input_param(
+                        self.state_mut().graph.add_input_param(
                             node_id,
                             String::from(input_name),
                             PulseDataType::Vec3,
@@ -338,7 +381,7 @@ impl PulseGraphEditor {
                         );
                     }
                     PulseValueType::PVAL_EHANDLE(_) => {
-                        self.state.graph.add_input_param(
+                        self.state_mut().graph.add_input_param(
                             node_id,
                             String::from(input_name),
                             PulseDataType::EHandle,
@@ -360,7 +403,7 @@ impl PulseGraphEditor {
         input_name: &str,
         kind: InputParamKind,
     ) {
-        self.state.graph.add_input_param(
+        self.state_mut().graph.add_input_param(
             node_id,
             String::from(input_name),
             data_typ,
@@ -375,7 +418,7 @@ impl PulseGraphEditor {
         data_typ: PulseDataType,
         output_name: &str,
     ) {
-        self.state
+        self.state_mut()
             .graph
             .add_output_param(node_id, String::from(output_name), data_typ);
     }
@@ -385,15 +428,15 @@ impl PulseGraphEditor {
         name: &String,
         new_type: Option<PulseValueType>,
     ) {
-        let node = self.state.graph.nodes.get_mut(node_id).unwrap();
+        let node = self.state().graph.nodes.get(node_id).unwrap();
         match node.user_data.template {
             PulseNodeTemplate::GetVar => {
                 let param = node.get_output("value");
                 if let Ok(param) = param {
-                    self.state.graph.remove_output_param(param);
+                    self.state_mut().graph.remove_output_param(param);
                 }
                 let var = self
-                    .user_state
+                    .user_state()
                     .variables
                     .iter()
                     .find(|var| var.name == *name);
@@ -404,10 +447,10 @@ impl PulseGraphEditor {
             PulseNodeTemplate::SetVar => {
                 let param = node.get_input("value");
                 if let Ok(param) = param {
-                    self.state.graph.remove_input_param(param);
+                    self.state_mut().graph.remove_input_param(param);
                 }
                 let var = self
-                    .user_state
+                    .user_state()
                     .variables
                     .iter()
                     .find(|var| var.name == *name);
@@ -433,9 +476,9 @@ impl PulseGraphEditor {
                 if param_a.is_err() || param_b.is_err() || param_out.is_err() {
                     panic!("node that requires inputs 'A', 'B' and output 'out', but one of them was not found");
                 }
-                self.state.graph.remove_input_param(param_a.unwrap());
-                self.state.graph.remove_input_param(param_b.unwrap());
-                self.state.graph.remove_output_param(param_out.unwrap());
+                self.state_mut().graph.remove_input_param(param_a.unwrap());
+                self.state_mut().graph.remove_input_param(param_b.unwrap());
+                self.state_mut().graph.remove_output_param(param_out.unwrap());
 
                 let types = pulse_value_type_to_node_types(&new_type);
                 self.add_node_input_simple(
@@ -458,7 +501,7 @@ impl PulseGraphEditor {
                 if name == "typefrom" {
                     let param_input = node.get_input("input");
                     if let Ok(param_input) = param_input {
-                        self.state.graph.remove_input_param(param_input);
+                        self.state_mut().graph.remove_input_param(param_input);
                         let types = pulse_value_type_to_node_types(&new_type.unwrap());
                         self.add_node_input_simple(
                             node_id,
@@ -471,7 +514,7 @@ impl PulseGraphEditor {
                 } else if name == "typeto" {
                     let param_output = node.get_output("out");
                     if let Ok(param_output) = param_output {
-                        self.state.graph.remove_output_param(param_output);
+                        self.state_mut().graph.remove_output_param(param_output);
                         let types = pulse_value_type_to_node_types(&new_type.unwrap());
                         self.add_node_output_simple(node_id, types.0, "out");
                     }
@@ -487,8 +530,8 @@ impl PulseGraphEditor {
                 if param_a.is_err() || param_b.is_err() {
                     panic!("node that requires inputs 'A' and 'B', but one of them was not found");
                 }
-                self.state.graph.remove_input_param(param_a.unwrap());
-                self.state.graph.remove_input_param(param_b.unwrap());
+                self.state_mut().graph.remove_input_param(param_a.unwrap());
+                self.state_mut().graph.remove_input_param(param_b.unwrap());
 
                 let types = pulse_value_type_to_node_types(&new_type);
                 self.add_node_input_simple(
@@ -517,7 +560,7 @@ impl PulseGraphEditor {
                 }
                 let param_output = node.get_output("out");
                 if let Ok(param_output) = param_output {
-                    self.state.graph.remove_output_param(param_output);
+                    self.state_mut().graph.remove_output_param(param_output);
                     let types = pulse_value_type_to_node_types(&new_type);
                     self.add_node_output_simple(node_id, types.0, "out");
                 }
@@ -533,12 +576,12 @@ impl PulseGraphEditor {
                 if output_id.is_err() {
                     panic!("node requires output 'out', but it was not found");
                 }
-                let output = self.state.graph.get_output_mut(output_id.unwrap());
+                let output = self.state_mut().graph.get_output_mut(output_id.unwrap());
                 output.typ = types.0.clone();
                 if param_vec.is_err(){
                     panic!("node that requires inputs 'A' and 'B', but one of them was not found");
                 }
-                self.state.graph.remove_input_param(param_vec.unwrap());
+                self.state_mut().graph.remove_input_param(param_vec.unwrap());
 
                 self.add_node_input_simple(
                     node_id,
@@ -552,7 +595,7 @@ impl PulseGraphEditor {
                 let types = pulse_value_type_to_node_types(&new_type.unwrap_or_default());
                 let inputs = node.user_data.added_inputs.clone();
                 for inp in inputs {
-                    let param = self.state.graph.get_input_mut(inp);
+                    let param = self.state_mut().graph.get_input_mut(inp);
                     param.typ = types.0.clone();
                     param.value = types.1.clone();
                 }
@@ -563,33 +606,33 @@ impl PulseGraphEditor {
 
     fn update_library_binding_params(&mut self, node_id: &NodeId, binding: &FunctionBinding) {
         let output_ids: Vec<_> = {
-            let node = self.state.graph.nodes.get_mut(*node_id).unwrap();
+            let node = self.state().graph.nodes.get(*node_id).unwrap();
             node.output_ids().collect()
         };
         for output in output_ids {
-            self.state.graph.remove_output_param(output);
+            self.state_mut().graph.remove_output_param(output);
         }
         let input_ids: Vec<_> = {
-            let node = self.state.graph.nodes.get_mut(*node_id).unwrap();
+            let node = self.state_mut().graph.nodes.get_mut(*node_id).unwrap();
             node.input_ids().collect()
         };
-        let node = self.state.graph.nodes.get(*node_id).unwrap();
+        let node = self.state().graph.nodes.get(*node_id).unwrap();
         let binding_chooser_input_id = node
             .get_input("binding")
             .expect("Expected 'Invoke library binding' node to have 'binding' input param");
         for input in input_ids {
             if input != binding_chooser_input_id {
-                self.state.graph.remove_input_param(input);
+                self.state_mut().graph.remove_input_param(input);
             }
         }
         // If it's action type (nodes that usually don't provide a value) make it have in and out actions.
         if binding.typ == LibraryBindingType::Action {
-            self.state.graph.add_output_param(
+            self.state_mut().graph.add_output_param(
                 *node_id,
                 "outAction".to_string(),
                 PulseDataType::Action,
             );
-            self.state.graph.add_input_param(
+            self.state_mut().graph.add_input_param(
                 *node_id,
                 "ActionIn".to_string(),
                 PulseDataType::Action,
@@ -602,7 +645,7 @@ impl PulseGraphEditor {
             for param in inparams {
                 let connection_kind = get_preffered_inputparamkind_from_type(&param.pulsetype);
                 let graph_types = pulse_value_type_to_node_types(&param.pulsetype);
-                self.state.graph.add_input_param(
+                self.state_mut().graph.add_input_param(
                     *node_id,
                     param.name.clone(),
                     graph_types.0,
@@ -614,7 +657,7 @@ impl PulseGraphEditor {
         }
         if let Some(outparams) = &binding.outparams {
             for param in outparams {
-                self.state.graph.add_output_param(
+                self.state_mut().graph.add_output_param(
                     *node_id,
                     param.name.clone(),
                     pulse_value_type_to_node_types(&param.pulsetype).0,
@@ -625,20 +668,20 @@ impl PulseGraphEditor {
 
     fn update_event_binding_params(&mut self, node_id: &NodeId, binding: &EventBinding) {
         let output_ids: Vec<_> = {
-            let node = self.state.graph.nodes.get_mut(*node_id).unwrap();
+            let node = self.state().graph.nodes.get(*node_id).unwrap();
             node.output_ids().collect()
         };
         for output in output_ids {
-            self.state.graph.remove_output_param(output);
+            self.state_mut().graph.remove_output_param(output);
         }
         // TODO: maybe instead of adding this back instead check in the upper loop, altho is seems a bit involved
         // so maybe this is just more efficient?
-        self.state
+        self.state_mut()
             .graph
             .add_output_param(*node_id, "outAction".to_string(), PulseDataType::Action);
         if let Some(inparams) = &binding.inparams {
             for param in inparams {
-                self.state.graph.add_output_param(
+                self.state_mut().graph.add_output_param(
                     *node_id,
                     param.name.clone(),
                     pulse_value_type_to_node_types(&param.pulsetype).0,
@@ -649,7 +692,7 @@ impl PulseGraphEditor {
 
     // Update inputs on "Call Node" depending on the type of referenced node.
     fn update_remote_node_params(&mut self, node_id: &NodeId, node_id_refrence: &NodeId) {
-        let node = self.state.graph.nodes.get_mut(*node_id).unwrap();
+        let node = self.state_mut().graph.nodes.get_mut(*node_id).unwrap();
         // remove all inputs
         let input_ids: Vec<_> = node.input_ids().collect();
         let output_ids: Vec<_> = node.output_ids().collect();
@@ -659,17 +702,17 @@ impl PulseGraphEditor {
         for input in input_ids {
             // don't remove the node chooser input
             if input != input_node_chooser {
-                self.state.graph.remove_input_param(input);
+                self.state_mut().graph.remove_input_param(input);
             }
         }
         for output in output_ids {
-            self.state.graph.remove_output_param(output);
+            self.state_mut().graph.remove_output_param(output);
         }
-        if let Some(reference_node) = self.state.graph.nodes.get(*node_id_refrence) {
+        if let Some(reference_node) = self.state().graph.nodes.get(*node_id_refrence) {
             let reference_node_template = reference_node.user_data.template;
             match reference_node_template {
                 PulseNodeTemplate::ListenForEntityOutput => {
-                    self.state.graph.add_input_param(
+                    self.state_mut().graph.add_input_param(
                         *node_id,
                         "hEntity".into(),
                         PulseDataType::EHandle,
@@ -677,7 +720,7 @@ impl PulseGraphEditor {
                         InputParamKind::ConnectionOnly,
                         true,
                     );
-                    self.state.graph.add_input_param(
+                    self.state_mut().graph.add_input_param(
                         *node_id,
                         "Run".into(),
                         PulseDataType::Action,
@@ -685,7 +728,7 @@ impl PulseGraphEditor {
                         InputParamKind::ConnectionOnly,
                         true,
                     );
-                    self.state.graph.add_input_param(
+                    self.state_mut().graph.add_input_param(
                         *node_id,
                         "Cancel".into(),
                         PulseDataType::Action,
@@ -695,7 +738,7 @@ impl PulseGraphEditor {
                     );
                 }
                 PulseNodeTemplate::Function => {
-                    self.state.graph.add_input_param(
+                    self.state_mut().graph.add_input_param(
                         *node_id,
                         "ActionIn".into(),
                         PulseDataType::Action,
@@ -703,21 +746,21 @@ impl PulseGraphEditor {
                         InputParamKind::ConnectionOnly,
                         true,
                     );
-                    self.state.graph.add_input_param(*node_id,
+                    self.state_mut().graph.add_input_param(*node_id,
                         "Async".into(),
                         PulseDataType::Bool,
                         PulseGraphValueType::Bool { value: Default::default() },
                         InputParamKind::ConstantOnly,
                         true,
                     );
-                    self.state.graph.add_output_param(
+                    self.state_mut().graph.add_output_param(
                         *node_id,
                         "outAction".into(),
                         PulseDataType::Action,
                     );
                 }
                 PulseNodeTemplate::Timeline => {
-                    self.state.graph.add_input_param(
+                    self.state_mut().graph.add_input_param(
                         *node_id,
                         "Start".into(),
                         PulseDataType::Action,
@@ -725,7 +768,7 @@ impl PulseGraphEditor {
                         InputParamKind::ConnectionOnly,
                         true,
                     );
-                    self.state.graph.add_input_param(
+                    self.state_mut().graph.add_input_param(
                         *node_id,
                         "Stop".into(),
                         PulseDataType::Action,
@@ -733,7 +776,7 @@ impl PulseGraphEditor {
                         InputParamKind::ConnectionOnly,
                         true,
                     );
-                    self.state.graph.add_output_param(
+                    self.state_mut().graph.add_output_param(
                         *node_id,
                         "outAction".into(),
                         PulseDataType::Action,
@@ -785,15 +828,15 @@ impl PulseGraphEditor {
     // until we reach a node that doesn't depend on polymorphic return type.
     fn update_polymorphic_output_types(&mut self, node_id: NodeId, source_type: Option<PulseValueType>, source_input_name: Option<&str>) -> anyhow::Result<()> {
         // if the node is a "Make Array" node, we need to update the output type based on the array type
-        let node_data = self.state.graph.nodes.get(node_id)
+        let node_data = self.state().graph.nodes.get(node_id)
             .ok_or(anyhow::anyhow!("Node with id {:?} not found in the graph", node_id))?;
-        if !has_polymorhpic_dependent_return(&node_data.user_data.template, &self.user_state) {
+        if !has_polymorhpic_dependent_return(&node_data.user_data.template, self.user_state()) {
             return Ok(());
         };
         
         let opt_new_type = match node_data.user_data.template {
             PulseNodeTemplate::NewArray => {
-                let graph = &self.state.graph;
+                let graph = &self.state().graph;
                 // TODO: get_constant_graph_input_value should probably be moved out of the compiler module
                 let typ = crate::compiler::get_constant_graph_input_value!(
                     graph,
@@ -809,11 +852,11 @@ impl PulseGraphEditor {
                 if let Some(source_type) = &source_type {
                     // if the source type is an array, we need to update the output type to the inner type
                     if let PulseValueType::PVAL_ARRAY(inner) = source_type {
-                        let node_data_mut = self.state.graph.nodes.get_mut(node_id).unwrap(); // already checked, can unwrap.
+                        let node_data_mut = self.state_mut().graph.nodes.get_mut(node_id).unwrap(); // already checked, can unwrap.
                         let out_id = node_data_mut.get_output("out")?;
                         node_data_mut.user_data.custom_output_type = Some((**inner).clone());
                         // update output in UI
-                        self.state.graph.get_output_mut(out_id).typ = pulse_value_type_to_node_types(inner).0;
+                        self.state_mut().graph.get_output_mut(out_id).typ = pulse_value_type_to_node_types(inner).0;
                         Some((**inner).clone())
                     } else {
                         panic!("GetArrayElement/ForEach node expected source type to be an array, but it was not. This is a bug!");
@@ -823,7 +866,7 @@ impl PulseGraphEditor {
                 }
             }
             PulseNodeTemplate::LibraryBindingAssigned { binding } => {
-                let binding = self.user_state.bindings
+                let binding = self.user_state().bindings
                     .find_function_by_id(binding)
                     .ok_or(anyhow::anyhow!("Library binding node can't find saved binding {:?}! Likely the bindings file is not correct.", binding))?;
                 let new_type = if let Some(typ) = source_type {
@@ -837,7 +880,7 @@ impl PulseGraphEditor {
                         PolimorphicTypeInfo::FullType (param_name) => {
                             println!("source input name: {}", source_input_name.unwrap_or_default());
                             if source_input_name.is_some_and(|f| f == param_name) || source_input_name.is_none() {
-                                let node_data_mut = self.state.graph.nodes.get_mut(node_id).unwrap();
+                                let node_data_mut = self.state_mut().graph.nodes.get_mut(node_id).unwrap();
                                 node_data_mut.user_data.custom_output_type = new_type.clone();
                                 new_type
                             } else {
@@ -851,7 +894,7 @@ impl PulseGraphEditor {
                             if source_input_name.is_some_and(|f| f == param_name) || source_input_name.is_none() {
                                 new_type.map(|new_type| {
                                     if let PulseValueType::PVAL_ARRAY(inner) = new_type {
-                                        let node_data_mut = self.state.graph.nodes.get_mut(node_id).unwrap();
+                                        let node_data_mut = self.state_mut().graph.nodes.get_mut(node_id).unwrap();
                                         node_data_mut.user_data.custom_output_type = Some(*inner.clone());
                                         *inner
                                     } else {
@@ -882,15 +925,15 @@ impl PulseGraphEditor {
                 // we only just provide info to connected nodes from this one
                 let name_id = node_data
                     .get_input("variableName")
-                    .map_err(|e| anyhow!(e).context(": Update polymorphic types"))?;
-                let var_name = self.state.graph
+                    .map_err(|e: EguiGraphError| anyhow!(e).context(": Update polymorphic types"))?;
+                let var_name = self.state().graph
                     .get_input(name_id)
                     .value()
                     .clone()
                     .try_variable_name()
                     .map_err(|e| anyhow!(e).context(": Update polymorphic types"))?;
                 let var = self
-                    .user_state
+                    .user_state()
                     .variables
                     .iter()
                     .find(|var| var.name == *var_name);
@@ -901,7 +944,7 @@ impl PulseGraphEditor {
         // now update the custom type in user data so the compiler can use it
         // this will only happen if the resulting type is not None
         if let Some(new_type) = &opt_new_type {
-            let node_data_mut = self.state.graph.nodes.get_mut(node_id).unwrap();
+            let node_data_mut = self.state_mut().graph.nodes.get_mut(node_id).unwrap();
             node_data_mut.user_data.custom_output_type = opt_new_type.clone();
             println!(
                 "[UI] Updating polymorphic output type of node {:?} to {:?}",
@@ -909,13 +952,13 @@ impl PulseGraphEditor {
             );
             // LOL, this needs to be slightly improved to make it more generic.
             let outnodes = get_node_ids_connected_to_output(
-                self.state.graph.nodes.get(node_id).unwrap(), &self.state.graph, "out")
+                self.state().graph.nodes.get(node_id).unwrap(), &self.state().graph, "out")
                 .unwrap_or_default();
             let outnodes2 = get_node_ids_connected_to_output(
-                self.state.graph.nodes.get(node_id).unwrap(), &self.state.graph, "retval")
+                self.state().graph.nodes.get(node_id).unwrap(), &self.state().graph, "retval")
                 .unwrap_or_default();
             let outnodes3 = get_node_ids_connected_to_output(
-                self.state.graph.nodes.get(node_id).unwrap(), &self.state.graph, "value")
+                self.state().graph.nodes.get(node_id).unwrap(), &self.state().graph, "value")
                 .unwrap_or_default();
             for node_and_input_name in outnodes.iter().chain(outnodes2.iter()).chain(outnodes3.iter()) {
                 // recursively update the output type of connected nodes
@@ -929,12 +972,12 @@ impl PulseGraphEditor {
         Ok(())
     }
     fn clone_node(&mut self, source_node_id: NodeId, pos_offset: egui::Vec2) -> NodeId {
-        let source_node_data = self.state.graph.nodes.get(source_node_id).unwrap();
+        let source_node_data = self.state().graph.nodes.get(source_node_id).unwrap();
         let source_label = source_node_data.label.clone();
         let source_user_data = source_node_data.user_data.clone();
         let inputs = source_node_data.inputs.clone();
         let outputs = source_node_data.outputs.clone();
-        let new_node = self.state.graph.add_node(
+        let new_node = self.state_mut().graph.add_node(
             source_label,
             source_user_data,
             |grph, node_id| {
@@ -963,19 +1006,19 @@ impl PulseGraphEditor {
             }
         );
         // unwraps should basically never fail, otherwise there would be bigger issues.
-        let orig_pos = self.state.node_positions.get(source_node_id).unwrap();
-        self.state.node_positions.insert(new_node,*orig_pos + pos_offset);
-        self.state.node_sizes.insert(new_node, *self.state.node_sizes.get(source_node_id).unwrap());
-        self.state.node_order.push(new_node);
+        let orig_pos = self.full_state.state.node_positions.get(source_node_id).unwrap();
+        self.full_state.state.node_positions.insert(new_node,*orig_pos + pos_offset);
+        self.full_state.state.node_sizes.insert(new_node, *self.state().node_sizes.get(source_node_id).unwrap());
+        self.full_state.state.node_order.push(new_node);
         // make sure exposed node info gets cloned as well (like function node)
-        if let Some(name) = self.user_state.exposed_nodes.get(source_node_id).cloned() {
-            self.user_state.exposed_nodes.insert(new_node, format!("{name} clone"));
+        if let Some(name) = self.user_state().exposed_nodes.get(source_node_id).cloned() {
+            self.user_state_mut().exposed_nodes.insert(new_node, format!("{name} clone"));
         }
         new_node
     }
 
     fn update_titlebar(&self, ctx: &egui::Context) {
-        let file_name = if let Some(file_path) = &self.user_state.save_file_path {
+        let file_name = if let Some(file_path) = &self.user_state().save_file_path {
             file_path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -989,18 +1032,48 @@ impl PulseGraphEditor {
             format!("{APP_NAME} - {}", file_name)
         ));
     }
+
+    fn feed_undo_state(&mut self) {
+        self.undoer.feed_state(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_secs_f64(), 
+            &self.full_state
+        );
+    }
+
+    fn do_undo(&mut self) {
+        let current_file = self.user_state().save_file_path.clone();
+        if let Some(state) = self.undoer.undo(&self.full_state) {
+            self.full_state = state.clone();
+        }
+        self.user_state_mut().save_file_path = current_file;
+        self.state_mut().connection_in_progress = None;
+    }
+
+    fn do_redo(&mut self) {
+        let current_file = self.user_state().save_file_path.clone();
+        if let Some(state) = self.undoer.redo(&self.full_state) {
+            self.full_state = state.clone();
+        }
+        self.user_state_mut().save_file_path = current_file;
+        self.state_mut().connection_in_progress = None;
+    }
 }
 
-impl PulseGraphEditor {
+impl PulseGraphEditor{
     /// If the persistence feature is enabled, Called once before the first frame.
     /// Load previous app state (if any).
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        
-        #[cfg(feature = "persistence")]
-        let mut grph: PulseGraphEditor = cc
-            .storage
-            .and_then(|storage| eframe::get_value(storage, PERSISTENCE_KEY))
-            .unwrap_or_default();
+        let mut grph = Self {
+            full_state: cc.storage
+                .and_then(|storage| eframe::get_value(storage, PERSISTENCE_KEY))
+                .unwrap_or_default(),
+            undoer: Self::get_new_undoer(),
+            current_modal_dialog: ModalWindow::default(),
+            version: FileVersion::default(),
+        };
 
         grph.update_titlebar(&cc.egui_ctx);
         #[cfg(feature = "nongame_asset_build")] {
@@ -1026,7 +1099,7 @@ impl PulseGraphEditor {
         let bindings = load_bindings(std::path::Path::new("bindings.json"));
         match bindings {
             Ok(bindings) => {
-                grph.user_state.bindings = bindings;
+                grph.user_state_mut().bindings = bindings;
             }
             Err(e) => {
                 MessageDialog::new()
@@ -1037,7 +1110,7 @@ impl PulseGraphEditor {
                     .show();
             }
         };
-        grph.verify_compat();
+        grph.full_state.verify_compat();
         grph
     }
 
@@ -1052,7 +1125,15 @@ impl PulseGraphEditor {
             return Err(e);
         }
         Ok(())
-    }   
+    }
+
+    fn get_new_undoer() -> Undoer<FullGraphState> {
+        Undoer::with_settings(Settings {
+            max_undos: 100,
+            stable_time: 0.2,
+            auto_save_interval: 30.0,
+        })
+    }
 }
 
 // assigns proper default values based on the text buffer, and updates the graph node types (DataTypes)
@@ -1153,14 +1234,20 @@ impl eframe::App for PulseGraphEditor {
     /// If the persistence function is enabled,
     /// Called by the frame work to save state before shutdown.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, PERSISTENCE_KEY, &self);
+        eframe::set_value(storage, PERSISTENCE_KEY, &self.full_state);
     }
     /// Called each time the UI needs repainting, which may be many times per second.
     /// Put your widgets into a `SidePanel`, `TopPanel`, `CentralPanel`, `Window` or `Area`.
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        
         ctx.set_visuals(egui::Visuals::dark());
         ctx.style_mut(|s| s.interaction.selectable_labels = false);
+        self.undoer.feed_state(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_secs_f64(), 
+            &self.full_state
+        );
         if self.current_modal_dialog.is_open {
             let modal = Modal::new(Id::new("MainModal")).show(ctx, |ui| {
                 match self.current_modal_dialog.window_type {
@@ -1197,7 +1284,7 @@ impl eframe::App for PulseGraphEditor {
                 if ui.button("Compile").clicked()
                     || ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::R)) {
                     if let Err(e) =
-                        compile_graph(&self.state.graph, &self.user_state, 
+                        compile_graph(&self.state().graph, self.user_state(), 
                             #[cfg(feature = "nongame_asset_build")]&self.editor_config)
                     {
                         MessageDialog::new()
@@ -1215,7 +1302,7 @@ impl eframe::App for PulseGraphEditor {
                 {
                     // is path set? if yes then save, if not promt the user first
                     let mut perform_save: bool = true;
-                    if self.user_state.save_file_path.is_none() {
+                    if self.user_state().save_file_path.is_none() {
                         perform_save = self.dialog_change_save_file();
                         self.update_titlebar(ctx);
                     }
@@ -1273,20 +1360,39 @@ impl eframe::App for PulseGraphEditor {
                     self.update_titlebar(ctx);
                 }
                 if ui.button("New").clicked()
-                    && !self.state.graph.nodes.is_empty() {
+                    && !self.state().graph.nodes.is_empty() {
                         self.current_modal_dialog.is_open = true;
                         self.current_modal_dialog.window_type = ModalWindowType::ConfirmSave;
                     }
+
+                if ui.add_enabled(
+                    self.undoer.has_undo(&self.full_state), egui::Button::new("⟲")
+                    ).clicked() ||
+                    ctx.input(|i| {
+                        i.modifiers.command && i.key_pressed(egui::Key::Z)
+                    })
+                {
+                    self.do_undo();
+                }
+                else if ui.add_enabled(
+                    self.undoer.has_redo(&self.full_state), egui::Button::new("⟳")
+                    ).clicked() ||
+                    ctx.input(|i| {
+                        i.modifiers.command && i.key_pressed(egui::Key::Y)
+                    })
+                {
+                    self.do_redo();
+                }
                 if !ctx.wants_keyboard_input() 
                     && ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::D)) {
-                    let selected_nodes: Vec<_> = self.state.selected_nodes.to_vec();
+                    let selected_nodes: Vec<_> = self.state().selected_nodes.to_vec();
                     let mut new_nodes: Vec<_> = vec![];
                     for node_id in selected_nodes {
                         new_nodes.push(
                             self.clone_node(node_id, Vec2::new(20.0, 20.0))
                         );
                     }
-                    self.state.selected_nodes = new_nodes;
+                    self.state_mut().selected_nodes = new_nodes;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                     if ui.button("Check for updates").clicked() {
@@ -1314,26 +1420,26 @@ impl eframe::App for PulseGraphEditor {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Graph domain").on_hover_text("Suggests which context the graph can be used in, and what features are available.");
-                        ui.text_edit_singleline(&mut self.user_state.graph_domain);
+                        ui.text_edit_singleline(&mut self.user_state_mut().graph_domain);
                     });
                     ui.horizontal(|ui| {
                         ui.label("Graph sub-type").on_hover_text("The type on which the graph will be ran on eg. point entity/model entity/panel.");
-                        ui.text_edit_singleline(&mut self.user_state.graph_subtype);
+                        ui.text_edit_singleline(&mut self.user_state_mut().graph_subtype);
                     });
                 });
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Outputs:");
                 if ui.button("Add output").clicked() {
-                    self.user_state
+                    self.user_state_mut()
                         .outputs_dropdown_choices
                         .push(PulseValueType::PVAL_INT(None));
-                    self.user_state.public_outputs.push(OutputDefinition {
+                    self.user_state_mut().public_outputs.push(OutputDefinition {
                         name: String::default(),
                         typ: PulseValueType::PVAL_INT(None),
                         typ_old: PulseValueType::PVAL_INT(None),
                     });
                 }
-                for (idx, outputdef) in self.user_state.public_outputs.iter_mut().enumerate() {
+                for (idx, outputdef) in self.full_state.user_state.public_outputs.iter_mut().enumerate() {
                     ui.add_space(4.0);
                     egui::Frame::default()
                         .inner_margin(8.0)
@@ -1364,12 +1470,13 @@ impl eframe::App for PulseGraphEditor {
                                 });
                         });
                         if outputdef.typ != outputdef.typ_old {
-                            let node_ids: Vec<_> = self.state.graph.iter_nodes().collect();
+                            let node_ids: Vec<_> = self.full_state.state.graph.iter_nodes().collect();
                             for nodeid in node_ids {
-                                let node = self.state.graph.nodes.get(nodeid).unwrap();
+                                let node = self.full_state.state.graph.nodes.get(nodeid).unwrap();
                                 if node.user_data.template == PulseNodeTemplate::FireOutput {
                                     let inp = node.get_input("outputName");
                                     let val = self
+                                        .full_state
                                         .state
                                         .graph
                                         .get_input(inp.unwrap())
@@ -1389,17 +1496,17 @@ impl eframe::App for PulseGraphEditor {
                 ui.separator();
                 ui.label("Variables:");
                 if ui.button("Add variable").clicked() {
-                    self.user_state
+                    self.user_state_mut()
                         .outputs_dropdown_choices
                         .push(PulseValueType::PVAL_INT(None));
-                    self.user_state.variables.push(PulseVariable {
+                    self.user_state_mut().variables.push(PulseVariable {
                         name: String::default(),
                         typ_and_default_value: PulseValueType::PVAL_INT(None),
                         data_type: PulseDataType::Scalar,
                         default_value_buffer: String::default(),
                     });
                 }
-                for (idx, var) in self.user_state.variables.iter_mut().enumerate() {
+                for (idx, var) in self.user_state_mut().variables.iter_mut().enumerate() {
                     ui.add_space(4.0);
                     egui::Frame::default()
                         .inner_margin(8.0)
@@ -1518,12 +1625,12 @@ impl eframe::App for PulseGraphEditor {
             });
         });
         if output_scheduled_for_deletion != usize::MAX {
-            self.user_state
+            self.user_state_mut()
                 .public_outputs
                 .remove(output_scheduled_for_deletion);
         }
         if variable_scheduled_for_deletion != usize::MAX {
-            self.user_state
+            self.user_state_mut()
                 .variables
                 .remove(variable_scheduled_for_deletion);
         }
@@ -1531,19 +1638,19 @@ impl eframe::App for PulseGraphEditor {
         let mut prepended_responses: Vec<NodeResponse<PulseGraphResponse, PulseNodeData>> = vec![];
         if ctx.input(|i| i.key_released(egui::Key::Delete)) {
             // delete selected nodes
-            for node_id in self.state.selected_nodes.iter() {
+            for node_id in self.state().selected_nodes.iter() {
                 prepended_responses.push(NodeResponse::DeleteNodeUi(*node_id));
             }
         }
 
         let graph_response = egui::CentralPanel::default()
             .show(ctx, |ui| {
-                self.state.draw_graph_editor(
+                self.full_state.state.draw_graph_editor(
                     ui,
                     AllMyNodeTemplates {
-                        game_function_count: self.user_state.bindings.gamefunctions.len()
+                        game_function_count: self.user_state().bindings.gamefunctions.len()
                     },
-                    &mut self.user_state,
+                    &mut self.full_state.user_state,
                     prepended_responses,
                 )
             })
@@ -1556,7 +1663,7 @@ impl eframe::App for PulseGraphEditor {
                     match user_event {
                         // node that supports adding parameters is trying to add one
                         PulseGraphResponse::AddOutputParam(node_id, name, datatype) => {
-                            self.state.graph.add_output_param(
+                            self.state_mut().graph.add_output_param(
                                 node_id,
                                 name,
                                 datatype,
@@ -1570,14 +1677,14 @@ impl eframe::App for PulseGraphEditor {
                             paramkind,
                             autoindex
                         ) => {
-                            let param_list = &mut self.state.graph.nodes.get_mut(node_id).unwrap().user_data.added_inputs;
+                            let param_list = &mut self.state_mut().graph.nodes.get_mut(node_id).unwrap().user_data.added_inputs;
                             let idx = param_list.len();
                             let name = if autoindex {
                                 format!("{name}{}", idx)
                             } else {
                                 name
                             };
-                            let input_id = self.state.graph.add_input_param(
+                            let input_id = self.state_mut().graph.add_input_param(
                                 node_id,
                                 name,
                                 datatype,
@@ -1585,26 +1692,26 @@ impl eframe::App for PulseGraphEditor {
                                 paramkind,
                                 true
                             );
-                            self.state.graph.nodes.get_mut(node_id).unwrap().user_data.added_inputs.push(input_id);
+                            self.state_mut().graph.nodes.get_mut(node_id).unwrap().user_data.added_inputs.push(input_id);
                         }
                         PulseGraphResponse::RemoveCustomInputParam(node_id, input_id) => {
-                            let param_list = &mut self.state.graph.nodes.get_mut(node_id).unwrap().user_data.added_inputs;
+                            let param_list = &mut self.state_mut().graph.nodes.get_mut(node_id).unwrap().user_data.added_inputs;
                             if let Some(pos) = param_list.iter().position(|x| *x == input_id) {
                                 param_list.remove(pos);
                             }
-                            self.state.graph.remove_input_param(input_id);
+                            self.state_mut().graph.remove_input_param(input_id);
                         }
                         PulseGraphResponse::RemoveOutputParam(node_id, name) => {
                             // node that supports adding parameters is removing one
                             let param = self
-                                .state
+                                .state()
                                 .graph
                                 .nodes
-                                .get_mut(node_id)
+                                .get(node_id)
                                 .unwrap()
                                 .get_output(&name)
                                 .unwrap();
-                            self.state.graph.remove_output_param(param);
+                            self.state_mut().graph.remove_output_param(param);
                         }
                         PulseGraphResponse::ChangeOutputParamType(node_id, name) => {
                             self.update_output_node_param(node_id, &name, "param");
@@ -1634,21 +1741,22 @@ impl eframe::App for PulseGraphEditor {
                     }
                 }
                 NodeResponse::DeleteNodeFull { node_id, .. } => {
-                    self.user_state.exposed_nodes.remove(node_id);
+                    self.user_state_mut().exposed_nodes.remove(node_id);
                 }
                 NodeResponse::CreatedNode(node_id) => {
                     // This stuff is actually insane btw.
                     // if the node is a library binding, then update the parameters
                     if let PulseNodeTemplate::LibraryBindingAssigned { binding } 
-                        = self.state.graph.nodes.get(node_id).unwrap().user_data.template {
-                        let binding_opt = self.user_state.bindings.find_function_by_id(binding).cloned();
+                        = self.state().graph.nodes.get(node_id).unwrap().user_data.template {
+                        let binding_opt = self.user_state().bindings.find_function_by_id(binding).cloned();
                         if let Some(binding) = binding_opt {
                             self.update_library_binding_params(&node_id, &binding);
                         }
                     }
+                    self.feed_undo_state();
                 }
                 NodeResponse::ConnectEventEnded { output, input: _ , input_hook: _} => {
-                    let graph = &self.state.graph;
+                    let graph = &self.state().graph;
                     let node_id = graph.get_output(output).node;
                     if let Err(e) = self.update_polymorphic_output_types(node_id, None, None) {
                         println!("[UI] Warning: Failed to update polymorphic output types: {e}");
@@ -1662,3 +1770,4 @@ impl eframe::App for PulseGraphEditor {
         }
     }
 }
+
